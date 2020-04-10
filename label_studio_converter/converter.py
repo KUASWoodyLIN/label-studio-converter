@@ -5,6 +5,8 @@ import logging
 import pandas as pd
 import xml.dom
 import xml.dom.minidom
+import urllib
+import numpy as np
 
 from enum import Enum
 from datetime import datetime
@@ -58,7 +60,7 @@ class Converter(object):
         self._data_keys, self._output_tags = self._get_data_keys_and_output_tags(output_tags)
         self._supported_formats = self._get_supported_formats()
 
-    def convert(self, input_data, output_data, format, is_dir=True, **kwargs):
+    def convert(self, input_data, output_data, format, is_dir=True, save_no_object_image=False, **kwargs):
         if isinstance(format, str):
             format = Format.from_string(format)
         if format == Format.JSON:
@@ -77,7 +79,7 @@ class Converter(object):
             self.convert_to_conll2003(input_data, output_data, is_dir=is_dir)
         elif format == Format.COCO:
             image_dir = kwargs.get('image_dir')
-            self.convert_to_coco(input_data, output_data, output_image_dir=image_dir, is_dir=is_dir)
+            self.convert_to_coco(input_data, output_data, output_image_dir=image_dir, is_dir=is_dir, save_no_object_image=save_no_object_image)
         elif format == Format.VOC:
             image_dir = kwargs.get('image_dir')
             self.convert_to_voc(input_data, output_data, output_image_dir=image_dir, is_dir=is_dir)
@@ -102,7 +104,7 @@ class Converter(object):
 
     def _get_supported_formats(self):
         if len(self._data_keys) > 1:
-            return [Format.JSON.name, Format.JSON_MIN.name, Format.CSV.name, Format.TSV.name]
+            return [Format.JSON.name, Format.JSON_MIN.name, Format.CSV.name, Format.TSV.name, Format.COCO.name]
         output_tag_types = set()
         input_tag_types = set()
         for info in self._schema.values():
@@ -113,7 +115,7 @@ class Converter(object):
         all_formats = [f.name for f in Format]
         if not ('Text' in input_tag_types and 'Labels' in output_tag_types):
             all_formats.remove(Format.CONLL2003.name)
-        if not ('Image' in input_tag_types and 'RectangleLabels' in output_tag_types):
+        if not ('Image' in input_tag_types and ('RectangleLabels' in output_tag_types or 'PolygonLabels' in output_tag_types)):
             all_formats.remove(Format.COCO.name)
             all_formats.remove(Format.VOC.name)
         return all_formats
@@ -150,8 +152,8 @@ class Converter(object):
                     'Currently only one completion could be added per task - '
                     'we can\'t convert more than one completions, but {num_completions} found in item: {item}'.format(
                         num_completions=len(d['completions']), item=json.dumps(d, indent=2)))
-            if d['completions'][0].get('skipped'):
-                return None
+            # if d['completions'][0].get('skipped'):
+            #     return None
             result = d['completions'][0]['result']
         elif 'result' in d:
             result = d['result']
@@ -243,7 +245,25 @@ class Converter(object):
                     fout.write('{token} -X- _ {tag}\n'.format(token=token, tag=tag))
                 fout.write('\n')
 
-    def convert_to_coco(self, input_data, output_dir, output_image_dir=None, is_dir=True):
+    def area_of_polygon(self, x, y):
+        """Calculates the area of an arbitrary polygon given its verticies"""
+        area = 0.0
+        for i in range(-1, len(x) - 1):
+            area += x[i] * (y[i + 1] - y[i - 1])
+        return abs(area) / 2.0
+
+    def findWidthHeight(self, points_list):
+        x_list = points_list[::2]
+        y_list = points_list[1::2]
+        xmax = max(x_list)
+        ymax = max(y_list)
+        xmin = min(x_list)
+        ymin = min(y_list)
+        w = (xmax - xmin)
+        h = (ymax - ymin)
+        return [xmin, ymin, w, h], self.area_of_polygon(x_list, y_list)
+
+    def convert_to_coco(self, input_data, output_dir, output_image_dir=None, is_dir=True, save_no_object_image=False):
         self._check_format(Format.COCO)
         ensure_dir(output_dir)
         output_file = os.path.join(output_dir, 'result.json')
@@ -255,14 +275,14 @@ class Converter(object):
             os.makedirs(output_image_dir, exist_ok=True)
             output_image_dir_rel = 'images'
         images, categories, annotations = [], [], []
-        category_name_to_id = {}
+        category_name_to_id = {}        # TODO: add custom category_name_to_id, ex {name1:0, name2:1}
         data_key = self._data_keys[0]
         item_iterator = self.iter_from_dir(input_data) if is_dir else self.iter_from_json_file(input_data)
         for item_idx, item in enumerate(item_iterator):
-            if not item['output']:
-                logger.warning('No completions found for item #' + str(item_idx))
-                continue
+            # Decode url -> Local path
             image_path = item['input'][data_key]
+            image_name, root = urllib.parse.unquote(image_path).split('?d=')
+            image_path = os.path.join(root, os.path.split(image_name)[-1])
             if not os.path.exists(image_path):
                 try:
                     image_path = download(image_path, output_image_dir)
@@ -271,40 +291,86 @@ class Converter(object):
                         image_path=image_path, item=item
                     ), exc_info=True)
                     continue
+
+            # If no objects "continue"
+            if not item['output']:
+                logger.warning('No completions found for item #' + str(item_idx))
+                width, height = get_image_size(image_path)
+                image_id = len(images) + 1
+                if save_no_object_image:
+                    images.append({
+                        'width': width,
+                        'height': height,
+                        'id': image_id,
+                        'file_name': image_path
+                    })
+                continue
+
             width, height = get_image_size(image_path)
-            image_id = len(images)
+            image_id = len(images) + 1
             images.append({
                 'width': width,
                 'height': height,
                 'id': image_id,
-                'file_name': os.path.join(output_image_dir_rel, os.path.basename(image_path))
+                'file_name': image_path
             })
-            bboxes = next(iter(item['output'].values()))
-            for bbox in bboxes:
-                category_name = bbox['rectanglelabels'][0]
-                if category_name not in category_name_to_id:
-                    category_id = len(categories)
-                    category_name_to_id[category_name] = category_id
-                    categories.append({
-                        'id': category_id,
-                        'name': category_name
+            objects = next(iter(item['output'].values()))
+            for obj in objects:
+                if obj['type'] == 'RectangleLabels':
+                    category_name = obj['rectanglelabels'][0]
+                    if category_name not in category_name_to_id:
+                        category_id = len(categories)
+                        category_name_to_id[category_name] = category_id
+                        categories.append({
+                            'id': category_id,
+                            'name': category_name
+                        })
+                    category_id = category_name_to_id[category_name]
+                    annotation_id = len(annotations) + 1
+
+                    x = int(obj['x'] / 100 * width)
+                    y = int(obj['y'] / 100 * height)
+                    w = int(obj['width'] / 100 * width)
+                    h = int(obj['height'] / 100 * height)
+                    annotations.append({
+                        'id': annotation_id,
+                        'image_id': image_id,
+                        'category_id': category_id,
+                        'segmentation': [],
+                        'bbox': [x, y, w, h],
+                        'ignore': 0,
+                        'iscrowd': 0,
+                        'area': w * h
                     })
-                category_id = category_name_to_id[category_name]
-                annotation_id = len(annotations)
-                x = int(bbox['x'] / 100 * width)
-                y = int(bbox['y'] / 100 * height)
-                w = int(bbox['width'] / 100 * width)
-                h = int(bbox['height'] / 100 * height)
-                annotations.append({
-                    'id': annotation_id,
-                    'image_id': image_id,
-                    'category_id': category_id,
-                    'segmentation': [],
-                    'bbox': [x, y, w, h],
-                    'ignore': 0,
-                    'iscrowd': 0,
-                    'area': w * h
-                })
+                else:
+                    category_name = obj['polygonlabels'][0]
+                    if category_name not in category_name_to_id:
+                        category_id = len(categories)
+                        category_name_to_id[category_name] = category_id
+                        categories.append({
+                            'id': category_id,
+                            'name': category_name
+                        })
+                    category_id = category_name_to_id[category_name]
+                    annotation_id = len(annotations)
+
+                    segmentation = []
+                    for x, y in obj['points']:
+                        segmentation.append(x / 100 * width)
+                        segmentation.append(y / 100 * width)
+
+                    bbox_list, area = self.findWidthHeight(segmentation)
+
+                    annotations.append({
+                        'id': annotation_id,
+                        'image_id': image_id,
+                        'category_id': category_id,
+                        'segmentation': segmentation,
+                        'bbox': bbox_list,
+                        'ignore': 0,
+                        'iscrowd': 0,
+                        'area': area
+                    })
 
         with io.open(output_file, mode='w') as fout:
             json.dump({
